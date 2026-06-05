@@ -1,0 +1,39 @@
+# macOS / editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Python generated files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local development and downloaded runtimes
+.cache/
+dotnet-install.sh
+dotnet-osx-x64/
+
+# Installed/runtime state if the repository is copied beside the game
+NMSModLoader/
+_NMSModLoader/
+MODS/
+*.pak
+*.log
+
+# Local planning and scratch notes
+task_plan.md
+findings.md
+progress.md
+.planning/
+.plan-attestation
+
+# Reference checkouts and legacy experiments kept locally only
+nms-mod-installer-macos/
+old/
+
+# Secrets/config accidents
+.env
+.env.*
+*.key
+*.pem
