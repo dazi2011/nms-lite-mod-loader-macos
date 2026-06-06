@@ -15,12 +15,12 @@ import argparse
 import hashlib
 import json
 import os
-import queue
+import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import traceback
 import xml.etree.ElementTree as ET
@@ -71,8 +71,7 @@ class LoaderError(RuntimeError):
 
 
 class Logger:
-    def __init__(self, ui_queue: Optional["queue.Queue[str]"] = None, mirror_stdout: bool = True, log_file: Optional[Path] = None):
-        self.ui_queue = ui_queue
+    def __init__(self, mirror_stdout: bool = True, log_file: Optional[Path] = None):
         self.mirror_stdout = mirror_stdout
         self.log_file = log_file
 
@@ -85,8 +84,6 @@ class Logger:
         line = f"[{stamp}] {message}"
         if self.mirror_stdout:
             print(line, flush=True)
-        if self.ui_queue is not None:
-            self.ui_queue.put(line)
         if self.log_file is not None:
             with self.log_file.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
@@ -411,6 +408,9 @@ def build_pak_index(paths: GamePaths, tool_path: str, log: Logger, force: bool =
 
 
 def attach_run_log(log: Logger, paths: GamePaths, prefix: str) -> Path:
+    if log.log_file is not None:
+        log(f"日志文件：{log.log_file}")
+        return log.log_file
     log_path = paths.state_dir / "logs" / f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}.log"
     log.attach_file(log_path)
     log(f"日志文件：{log_path}")
@@ -1028,100 +1028,109 @@ def priority_command(args: argparse.Namespace, log: Logger) -> int:
     raise LoaderError(f"Unknown priority action: {args.action}")
 
 
-def run_with_gui(worker: Callable[[Logger], int]) -> int:
-    def show_native_splash() -> None:
-        if sys.platform != "darwin":
-            return
-        message = "NMS Mod Loader\n模组加载器已启动\n正在扫描模组 / 备份 PAK / 应用模组"
-        script = (
-            f'display dialog {json.dumps(message)} '
-            'buttons {"OK"} default button "OK" '
-            'giving up after 4 with title "NMS Mod Loader"'
+def terminal_watch_command(log_path: Path, done_path: Path) -> str:
+    log_arg = shlex.quote(str(log_path))
+    done_arg = shlex.quote(str(done_path))
+    shell = (
+        "clear; "
+        "printf '\\033]0;NMS Mod Loader\\007'; "
+        "printf 'NMS Mod Loader\\nWaiting for loader output...\\n\\n'; "
+        f"/usr/bin/tail -n +1 -F {log_arg} & tail_pid=$!; "
+        f"while [ ! -f {done_arg} ]; do /bin/sleep 0.2; done; "
+        f"/bin/rm -f {done_arg}; "
+        "/bin/kill \"$tail_pid\" >/dev/null 2>&1 || true; "
+        "wait \"$tail_pid\" >/dev/null 2>&1 || true; "
+        "printf '\\nPAK restore complete. Closing this window...\\n'; "
+        "/bin/sleep 1"
+    )
+    return f"/bin/bash -lc {shlex.quote(shell)}"
+
+
+def terminal_open_script(command: str) -> str:
+    return (
+        'tell application "Terminal"\n'
+        "  activate\n"
+        f"  set loaderTab to do script {json.dumps(command)}\n"
+        '  set custom title of loaderTab to "NMS Mod Loader"\n'
+        "  set loaderId to id of front window\n"
+        "end tell\n"
+        "try\n"
+        '  tell application "System Events"\n'
+        '    set frontmost of process "Terminal" to true\n'
+        "  end tell\n"
+        "end try\n"
+        "return loaderId"
+    )
+
+
+def terminal_close_script(window_id: int) -> str:
+    return (
+        'tell application "Terminal"\n'
+        f"  if exists (first window whose id is {window_id}) then\n"
+        f"    close (first window whose id is {window_id})\n"
+        "  end if\n"
+        "end tell"
+    )
+
+
+def open_terminal_window(log_path: Path, done_path: Path) -> Optional[int]:
+    if sys.platform != "darwin":
+        return None
+    command = terminal_watch_command(log_path, done_path)
+    try:
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", terminal_open_script(command)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=helper_env(),
         )
-        try:
-            subprocess.Popen(
-                ["/usr/bin/osascript", "-e", script],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=helper_env(),
-            )
-        except Exception:
-            pass
-
-    try:
-        import tkinter as tk
-        from tkinter import scrolledtext
     except Exception:
-        show_native_splash()
-        return worker(Logger())
+        return None
+    if result.returncode != 0:
+        return None
+    match = re.search(r"\d+", result.stdout)
+    return int(match.group()) if match else None
 
-    q: "queue.Queue[str]" = queue.Queue()
-    result: Dict[str, int] = {"code": 1}
-    done = threading.Event()
 
-    root = tk.Tk()
-    root.title("NMS Mod Loader")
-    root.geometry("620x300+120+120")
-    root.resizable(True, True)
-    root.attributes("-topmost", True)
-    root.after(8000, lambda: root.attributes("-topmost", False))
-
-    label = tk.Label(root, text="No Man's Sky Mod Loader", anchor="w")
-    label.pack(fill="x", padx=10, pady=(8, 0))
-    text = scrolledtext.ScrolledText(root, height=14, wrap="word")
-    text.pack(fill="both", expand=True, padx=10, pady=8)
-    text.configure(state="disabled")
-
-    def append(line: str) -> None:
-        text.configure(state="normal")
-        text.insert("end", line + "\n")
-        text.see("end")
-        text.configure(state="disabled")
-
-    def poll() -> None:
-        while True:
-            try:
-                item = q.get_nowait()
-            except queue.Empty:
-                break
-            append(item)
-        if done.is_set():
-            label.configure(text=f"Done (exit {result['code']})")
-            root.after(2500, root.destroy)
-            return
-        root.after(100, poll)
-
-    def thread_main() -> None:
-        try:
-            result["code"] = worker(Logger(q))
-        except Exception:
-            q.put(traceback.format_exc())
-            result["code"] = 1
-        finally:
-            done.set()
-
-    def on_close() -> None:
-        root.withdraw()
-
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    root.update_idletasks()
-    root.deiconify()
-    root.lift()
+def close_terminal_window(window_id: Optional[int]) -> None:
+    if sys.platform != "darwin" or window_id is None:
+        return
     try:
-        root.focus_force()
+        subprocess.run(
+            ["/usr/bin/osascript", "-e", terminal_close_script(window_id)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            env=helper_env(),
+        )
     except Exception:
         pass
-    if sys.platform == "darwin":
-        script = f'tell application "System Events" to set frontmost of first process whose unix id is {os.getpid()} to true'
-        try:
-            subprocess.Popen(["/usr/bin/osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=helper_env())
-        except Exception:
-            pass
 
-    threading.Thread(target=thread_main, daemon=False).start()
-    root.after(100, poll)
-    root.mainloop()
-    return result["code"]
+
+def run_with_terminal(worker: Callable[[Logger], int], state_dir: Path) -> int:
+    logs_dir = state_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    token = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+    log_path = logs_dir / f"loader-{token}.log"
+    done_path = logs_dir / f".loader-{token}.done"
+    done_path.unlink(missing_ok=True)
+    log_path.touch()
+    window_id = open_terminal_window(log_path, done_path)
+    log = Logger(log_file=log_path)
+    if window_id is None and sys.platform == "darwin":
+        log("无法打开 Terminal 日志窗口，继续在后台运行；请查看日志文件")
+    try:
+        return worker(log)
+    except Exception:
+        log(traceback.format_exc())
+        return 1
+    finally:
+        log("加载器流程结束，PAK 恢复阶段已完成")
+        done_path.touch()
+        if window_id is not None:
+            time.sleep(1.5)
+            close_terminal_window(window_id)
 
 
 def split_passthrough(argv: Sequence[str]) -> Tuple[List[str], List[str]]:
@@ -1142,7 +1151,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_launch = sub.add_parser("launch", help="Patch mods, launch game, restore PAKs after exit")
     add_common(p_launch)
-    p_launch.add_argument("--no-gui", action="store_true", help="Print logs instead of showing the small window")
+    p_launch.add_argument(
+        "--no-terminal",
+        "--no-gui",
+        dest="no_terminal",
+        action="store_true",
+        help="Do not open the foreground Terminal log window",
+    )
     p_launch.add_argument("--skip-mods", action="store_true", help="Launch without scanning/applying mods")
     p_launch.add_argument("passthrough", nargs=argparse.REMAINDER, help="Arguments after -- are passed to the game")
 
@@ -1176,9 +1191,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             passthrough = list(args.passthrough)
             if passthrough and passthrough[0] == "--":
                 passthrough = passthrough[1:]
-            if args.no_gui:
+            if args.no_terminal:
                 return launch_flow(args, passthrough, Logger())
-            return run_with_gui(lambda log: launch_flow(args, passthrough, log))
+            paths = resolve_game_paths(args.game_app, args.real_exe)
+            return run_with_terminal(lambda log: launch_flow(args, passthrough, log), paths.state_dir)
         if args.command == "scan":
             return scan_command(args, Logger())
         if args.command == "index":

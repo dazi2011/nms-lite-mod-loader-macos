@@ -6,16 +6,18 @@ The loader is designed for one simple workflow:
 
 1. Steam launches `No Man's Sky.app` as usual.
 2. A small shim runs this loader first.
-3. The loader scans the sibling `MODS/` folder.
-4. Matching mod files are temporarily applied into the affected game PAKs.
-5. The original game executable is launched with Steam's arguments and environment preserved.
-6. When the game exits, the original PAKs are restored.
+3. Terminal opens in the foreground and displays the live loader log.
+4. The loader scans the sibling `MODS/` folder.
+5. Matching mod files are temporarily applied into the affected game PAKs.
+6. The original game executable is launched with Steam's arguments and environment preserved.
+7. When the game exits, the original PAKs are restored and the Terminal window closes.
 
 This avoids permanent PAK edits while still making EXML/MBIN style mods usable on macOS.
 
 ## Features
 
 - Steam-friendly app shim: Steam still launches the same `.app` and executable name.
+- Foreground Terminal log: shows scanning, backup, patching, game launch, exit, and PAK restoration.
 - Sibling `MODS/` folder: place the loader beside `No Man's Sky.app` and put mods in `MODS/MyMod/`.
 - Temporary patching: affected PAKs are backed up before launch and restored after the game exits.
 - Crash recovery: if a previous session did not restore cleanly, the next launch restores first.
@@ -24,7 +26,7 @@ This avoids permanent PAK edits while still making EXML/MBIN style mods usable o
 - Incremental PAK file-tree cache with optional SHA256 signatures.
 - Mod priority control for overlapping mods.
 - Repair command for Steam/game updates that overwrite the shim.
-- Update command for syncing newer loader scripts into an installed loader.
+- Self-update command that downloads the latest `main` branch from this repository.
 
 ## Requirements
 
@@ -49,8 +51,10 @@ No Man's Sky/
 ├── NMSModLoader/
 │   ├── nms_lite_loader.py
 │   ├── nms_loader_mbin.py
+│   ├── setup_nms_loader.py
 │   ├── requirements.txt
 │   ├── .venv/
+│   ├── vendor/mbincompiler/
 │   └── tools/
 └── _NMSModLoader/
     ├── cache/
@@ -184,7 +188,9 @@ python3 nms_lite_loader.py index --game-app "/path/to/No Man's Sky.app" --hashes
 
 After installation, launch the game from Steam normally.
 
-The loader will show a small startup dialog or log window, scan mods, apply matched files, start the game, and restore original PAKs after exit.
+The loader opens Terminal in the foreground, streams the complete launch log, scans and applies mods, starts the game, and waits for the game process to exit. The window remains open until the original PAKs have been restored, then closes automatically.
+
+The actual loader and game process remain in Steam's original launch chain. Terminal only follows the log file, so Steam launch arguments and environment variables are not transferred through a separate shell session.
 
 Preview mod matching without launching:
 
@@ -230,15 +236,30 @@ python3 setup_nms_loader.py repair --game-dir "/path/to/steamapps/common/No Man'
 
 `repair` rotates the newly updated official executable into `.nms-loader-original` and writes a fresh shim.
 
-## Update Installed Loader Scripts
+## Update From This Repository
 
-After pulling or editing this project, sync the installed loader:
+The installed updater downloads and validates the latest source archive from:
 
-```bash
-python3 setup_nms_loader.py update --game-dir "/path/to/steamapps/common/No Man's Sky"
+```text
+https://github.com/dazi2011/nms-lite-mod-loader-macos
 ```
 
-This copies current project scripts into `NMSModLoader/`, refreshes dependencies, rewrites the shim, and refreshes the PAK index cache.
+Run:
+
+```bash
+python3 "/path/to/steamapps/common/No Man's Sky/NMSModLoader/setup_nms_loader.py" update \
+  --game-dir "/path/to/steamapps/common/No Man's Sky"
+```
+
+`update` downloads the latest `main` branch into a temporary directory, verifies the required project files, then updates `NMSModLoader/`, dependencies, the executable shim, and the PAK index cache. A download or archive-validation failure leaves the installed loader unchanged.
+
+Preview the update without downloading or changing files:
+
+```bash
+python3 "/path/to/steamapps/common/No Man's Sky/NMSModLoader/setup_nms_loader.py" update \
+  --game-dir "/path/to/steamapps/common/No Man's Sky" \
+  --dry-run
+```
 
 ## Uninstall
 
@@ -276,3 +297,12 @@ Logs:
 ## Not Affiliated
 
 This project is not affiliated with Hello Games, No Man's Sky, Steam, Valve, MBINCompiler, or hgpaktool.
+
+## Thanks
+
+This loader depends on two excellent community projects:
+
+- [MBINCompiler](https://github.com/monkeyman192/MBINCompiler), maintained by monkeyman192 and contributors, for converting No Man's Sky MBIN/MXML data.
+- [HGPAKtool](https://github.com/monkeyman192/HGPAKtool), maintained by monkeyman192 and contributors, for reading, extracting, and rebuilding No Man's Sky PAK archives.
+
+Thank you to both projects and their contributors. This loader would not provide its core mod application workflow without their work.

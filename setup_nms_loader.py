@@ -16,8 +16,12 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 import time
+import urllib.request
 import venv
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +39,16 @@ LOADER_DIR_NAME = "NMSModLoader"
 MODS_DIR_NAME = "MODS"
 SHIM_MARKER = "NMS_LITE_LOADER_SHIM"
 INSTALL_STATE = "install_state.json"
+UPDATE_REPOSITORY = "dazi2011/nms-lite-mod-loader-macos"
+UPDATE_BRANCH = "main"
+UPDATE_ARCHIVE_URL = f"https://github.com/{UPDATE_REPOSITORY}/archive/refs/heads/{UPDATE_BRANCH}.zip"
+REQUIRED_PROJECT_FILES = (
+    "README.md",
+    "nms_lite_loader.py",
+    "nms_loader_mbin.py",
+    "requirements.txt",
+    "setup_nms_loader.py",
+)
 
 
 class SetupError(RuntimeError):
@@ -59,6 +73,14 @@ class Plan:
         if not self.dry_run:
             return fn(*args, **kwargs)
         return None
+
+
+def open_update_archive(url: str):
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "nms-lite-mod-loader-macos-updater"},
+    )
+    return urllib.request.urlopen(request, timeout=60)
 
 
 def resolve_game_dir(raw: Optional[str]) -> Path:
@@ -126,7 +148,12 @@ def write_text(path: Path, text: str) -> None:
 
 def copy_file(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}")
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def make_executable(path: Path) -> None:
@@ -160,8 +187,18 @@ def venv_python(loader_dir: Path) -> Path:
 
 def ensure_loader_files(project_dir: Path, loader_dir: Path, plan: Plan) -> None:
     plan.run("Create loader and MODS directories", lambda: ((loader_dir / "tools").mkdir(parents=True, exist_ok=True), (loader_dir.parent / MODS_DIR_NAME).mkdir(exist_ok=True)))
-    for filename in ("nms_lite_loader.py", "nms_loader_mbin.py", "requirements.txt", "README.md"):
+    for filename in REQUIRED_PROJECT_FILES:
         plan.run(f"Copy {filename}", copy_file, project_dir / filename, loader_dir / filename)
+    vendor_src = project_dir / "vendor" / "mbincompiler"
+    if vendor_src.is_dir():
+        for source in sorted(vendor_src.iterdir()):
+            if source.is_file():
+                plan.run(
+                    f"Copy bundled MBINCompiler file {source.name}",
+                    copy_file,
+                    source,
+                    loader_dir / "vendor" / "mbincompiler" / source.name,
+                )
 
 
 def ensure_dependencies(project_dir: Path, loader_dir: Path, args: argparse.Namespace, plan: Plan, dry_run: bool) -> None:
@@ -172,7 +209,7 @@ def ensure_dependencies(project_dir: Path, loader_dir: Path, args: argparse.Name
     plan.say("[run] Create/update Python venv and install Python dependencies")
     create_venv_and_install(loader_dir, plan.say)
     plan.say(f"[run] MBINCompiler mode: {args.mbin}")
-    nms_loader_mbin.ensure_mbincompiler(Path(__file__).resolve().parent, loader_dir / "tools", args.mbin, plan.say)
+    nms_loader_mbin.ensure_mbincompiler(project_dir, loader_dir / "tools", args.mbin, plan.say)
     if not getattr(args, "no_mbin_self_test", False) and args.mbin != "skip":
         result = nms_loader_mbin.self_test(loader_dir / "tools", plan.say)
         (loader_dir / "tools" / "mbincompiler_self_test.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -192,6 +229,38 @@ def preindex_cache(app: Path, loader_dir: Path, args: argparse.Namespace, plan: 
     if not getattr(args, "index_no_hashes", False):
         cmd.append("--hashes")
     plan.run("Build or refresh PAK file tree cache", subprocess.check_call, cmd)
+
+
+def download_repository_snapshot(
+    destination: Path,
+    archive_url: str = UPDATE_ARCHIVE_URL,
+    opener=open_update_archive,
+) -> Path:
+    destination.mkdir(parents=True, exist_ok=True)
+    archive_path = destination / "source.zip"
+    extract_dir = destination / "source"
+    try:
+        with opener(archive_url) as response, archive_path.open("wb") as output:
+            shutil.copyfileobj(response, output)
+        with zipfile.ZipFile(archive_path) as archive:
+            for member in archive.infolist():
+                member_path = Path(member.filename)
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise SetupError(f"Update archive contains an unsafe path: {member.filename}")
+            archive.extractall(extract_dir)
+    except SetupError:
+        raise
+    except Exception as exc:
+        raise SetupError(f"Unable to download or unpack update from {archive_url}: {exc}") from exc
+
+    candidates = [path for path in extract_dir.iterdir() if path.is_dir()]
+    if len(candidates) != 1:
+        raise SetupError("Update archive does not contain exactly one project directory")
+    project_dir = candidates[0]
+    missing = [filename for filename in REQUIRED_PROJECT_FILES if not (project_dir / filename).is_file()]
+    if missing:
+        raise SetupError("Update archive is missing required files: " + ", ".join(missing))
+    return project_dir
 
 
 def shim_text(loader_dir: Path, app: Path, real: Path) -> str:
@@ -341,19 +410,30 @@ def update_installed_loader(args: argparse.Namespace, dry_run: bool = False) -> 
     game_dir = resolve_game_dir(args.game_dir)
     app, _macos_dir, exe, real, loader_dir = paths_for(game_dir)
     plan = Plan(dry_run, loader_dir / "setup.log")
-    project_dir = Path(__file__).resolve().parent
     if not real.exists():
         raise SetupError(f"Original executable backup not found: {real}; run install or repair first")
     if exe.exists() and not is_shim(exe) and not args.force:
         raise SetupError("Current executable is not our shim. Steam likely updated the game; run `repair` or pass --force if you know what changed.")
-    plan.say("Update mode syncs the current project files into the installed loader.")
-    ensure_loader_files(project_dir, loader_dir, plan)
-    ensure_dependencies(project_dir, loader_dir, args, plan, dry_run)
-    plan.run("Rewrite executable shim", write_text, exe, shim_text(loader_dir, app, real))
-    plan.run("Mark shim executable", make_executable, exe)
-    if not dry_run:
-        write_install_state(game_dir, app, exe, real, loader_dir)
-    preindex_cache(app, loader_dir, args, plan, dry_run)
+    plan.say(f"Update source: https://github.com/{UPDATE_REPOSITORY} branch {UPDATE_BRANCH}")
+
+    def apply_update(project_dir: Path) -> None:
+        ensure_loader_files(project_dir, loader_dir, plan)
+        ensure_dependencies(project_dir, loader_dir, args, plan, dry_run)
+        plan.run("Rewrite executable shim", write_text, exe, shim_text(loader_dir, app, real))
+        plan.run("Mark shim executable", make_executable, exe)
+        if not dry_run:
+            write_install_state(game_dir, app, exe, real, loader_dir)
+        preindex_cache(app, loader_dir, args, plan, dry_run)
+
+    if dry_run:
+        plan.say(f"[dry-run] Download and validate {UPDATE_ARCHIVE_URL}")
+        apply_update(Path(__file__).resolve().parent)
+    else:
+        with tempfile.TemporaryDirectory(prefix="nms-loader-update-") as temp_dir:
+            plan.say(f"[run] Downloading latest {UPDATE_BRANCH} archive")
+            project_dir = download_repository_snapshot(Path(temp_dir))
+            plan.say("[run] Update archive validated")
+            apply_update(project_dir)
     print("Update plan complete." if dry_run else "Updated.")
     return 0
 
@@ -450,7 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
     index_opts(p_index)
     p_index.add_argument("--dry-run", action="store_true", help="Show index command without modifying cache")
 
-    p_update = sub.add_parser("update", help="Sync current project scripts into the installed loader")
+    p_update = sub.add_parser("update", help=f"Download {UPDATE_REPOSITORY}:{UPDATE_BRANCH} and update the installed loader")
     common(p_update)
     deps_opts(p_update)
     index_opts(p_update)
